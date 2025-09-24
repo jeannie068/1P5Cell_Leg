@@ -1,0 +1,257 @@
+void Legalizer::AllocateIllegalInstances() {
+  const double row_height = Site::height();
+  const double site_width = Site::width();
+  const int num_rows = database_.num_rows();
+  const int num_row_sites = database_.num_sites() / num_rows;
+  const RowId bottom_row_id(0);
+  const RowId top_row_id(database_.num_rows() - 1);
+  const int left_site = 0;
+  const int right_site = num_row_sites - 1;
+
+  for (int h = database_.max_instance_row_height() - 1; h >= 0; --h) {
+    for (int i = 0; i < illegal_instance_ids_by_row_height_.at(h).size(); i++) {
+      const InstanceId current_instance_id =
+          illegal_instance_ids_by_row_height_.at(h)[i];
+      Instance& current_instance = database_.instance(current_instance_id);
+
+      const double current_instance_x =
+          current_instance.global_placed_position().x();
+      const double current_instance_y =
+          current_instance.global_placed_position().y();
+      const double current_instance_width = current_instance.width();
+      const int current_instance_site_width =
+          static_cast<int>(current_instance.width() / site_width);
+      const int current_instance_row_height =
+          current_instance.num_sub_instances();
+      RowId nearest_row_id(
+          static_cast<int>((current_instance_y + 0.5 * row_height -
+                            database_.die_rect().min_corner().y()) /
+                           row_height));
+      int nearest_row_site =
+          static_cast<int>((current_instance_x + 0.5 * site_width -
+                            database_.die_rect().min_corner().x()) /
+                           site_width);
+
+      // Fence Region information
+      const FenceRegionId fenge_region_id = current_instance.fence_region_id();
+
+      if (nearest_row_id < bottom_row_id) {
+        nearest_row_id = bottom_row_id;
+      } else if (nearest_row_id >
+                 top_row_id - current_instance_row_height + 1) {
+        nearest_row_id = top_row_id - current_instance_row_height + 1;
+      }
+
+      assert(nearest_row_id >= bottom_row_id &&
+             nearest_row_id <= top_row_id - current_instance_row_height + 1);
+
+      // Find start point in fence region position
+      Row& near_row = database_.row(nearest_row_id);
+      if (!near_row.has_interval_of_fence_region(fenge_region_id)) {
+        for (int j = 0; j < 2 * database_.num_rows(); ++j) {
+          if (j % 2 == 0) {
+            nearest_row_id += j;
+          } else {
+            nearest_row_id -= j;
+          }
+          if (nearest_row_id < bottom_row_id ||
+              nearest_row_id > top_row_id - current_instance_row_height + 1) {
+            continue;
+          }
+          assert(nearest_row_id >= bottom_row_id &&
+                 nearest_row_id <=
+                     top_row_id - current_instance_row_height + 1);
+
+          const Row& test_row = database_.row(nearest_row_id);
+          if (test_row.has_interval_of_fence_region(fenge_region_id)) {
+            near_row = test_row;
+            break;
+          }
+        }
+      }
+
+      if (near_row.has_interval_of_fence_region_before(fenge_region_id,
+                                                       current_instance_x)) {
+        const IntervalId before_interval_id =
+            near_row.interval_id_of_fence_region_before(fenge_region_id,
+                                                        current_instance_x);
+        const Interval& before_interval =
+            database_.interval(before_interval_id);
+        const double interval_start = before_interval.begin();
+        const double interval_end = before_interval.end();
+        if (interval_start < current_instance_x &&
+            current_instance_x + current_instance_width < interval_end) {
+          // case C
+        } else {
+          // case D case E
+          nearest_row_site = static_cast<int>(
+              (interval_end - site_width * current_instance_site_width +
+               0.5 * site_width - database_.die_rect().min_corner().x()) /
+              site_width);
+        }
+      } else {
+        const IntervalId after_has_interval_id =
+            near_row.interval_id_of_fence_region_after(fenge_region_id,
+                                                       current_instance_x);
+        const Interval& after_interval =
+            database_.interval(after_has_interval_id);
+        const double interval_start = after_interval.begin();
+        nearest_row_site =
+            static_cast<int>((interval_start + 0.5 * site_width -
+                              database_.die_rect().min_corner().x()) /
+                             site_width);
+      }
+
+      double displacement;
+      double displacement_x;
+      double displacement_y;
+      double best_displacement = numeric_limits<double>::max();
+      int best_site_x = 0;
+      int best_site_y = 0;
+
+      RowId current_row_id = nearest_row_id;
+      bool out_of_loop = false;
+      for (int j = 0; j < 2 * database_.num_rows(); ++j) {
+        if (out_of_loop) {
+          break;
+        }
+        if (j % 2 == 0) {
+          current_row_id += j;
+        } else {
+          current_row_id -= j;
+        }
+
+        // Meet top and bottom row
+        if (current_row_id < bottom_row_id ||
+            current_row_id > top_row_id - current_instance_row_height + 1) {
+          continue;
+        }
+
+        assert(current_row_id >= bottom_row_id &&
+               current_row_id <= top_row_id - current_instance_row_height + 1);
+
+        const Row& current_row = database_.row(current_row_id);
+        // meet fence region constraint
+        if (!current_row.has_interval_of_fence_region(fenge_region_id)) {
+          continue;
+        }
+        const double site_y = current_row.position().y();
+
+        // Meet P/G rail constraints.
+        bool is_pg_rail_correct = true;
+        // Only consider the rails on metal 1.
+        if (current_row.has_rail_on_layer(LayerId(0))) {
+          const RailId rail_id = current_row.rail_id_on_layer(LayerId(0));
+          const Rail& rail = database_.rail(rail_id);
+
+          // 檢查是否需要翻轉
+          bool will_flip = (current_instance.orientation() != current_row.orientation());
+          bool effective_is_bottom_ground = current_instance.is_bottom_ground();
+
+          if (will_flip) {
+            effective_is_bottom_ground = !effective_is_bottom_ground;
+          }
+
+          // 使用翻轉後的值來檢查
+          if ((current_instance_row_height % 2 == 0) &&
+              ((effective_is_bottom_ground && rail.type() == NetType::POWER) ||
+              (!effective_is_bottom_ground && rail.type() == NetType::GROUND))) {
+            is_pg_rail_correct = false;
+          }
+        }
+        if (!is_pg_rail_correct) {
+          continue;
+        }
+
+        int current_row_site = nearest_row_site;
+        for (int k = 0; k < 2 * num_row_sites; k++) {
+          if (k % 2 == 0) {
+            current_row_site += k;
+          } else {
+            current_row_site -= k;
+          }
+          // Meet left and right site
+          if ((current_row_site < left_site) ||
+              ((current_row_site + current_instance_site_width) >
+               (right_site + 1))) {
+            continue;
+          }
+
+          // decide position
+          const double site_x = current_row_site * site_width;
+
+          // check sub_instance bottom to top
+          bool jump_out_of_loop = false;
+          for (int m = 0; m < current_instance.num_sub_instances(); ++m) {
+            // check sub_instance left to right
+            for (int n = 0; n < current_instance_site_width; ++n) {
+              const SiteId site_id = database_.site_id_by_position(
+                  Point(site_x + n * site_width, site_y + m * row_height));
+              const Site& site = database_.site(site_id);
+              const FenceRegionId& site_fenge_region_id =
+                  site.fence_region_id();
+              if (!site.is_valid() || site.has_sub_instance() ||
+                  site_fenge_region_id != fenge_region_id) {
+                jump_out_of_loop = true;
+                break;
+              }
+            }
+            if (jump_out_of_loop) {
+              break;
+            }
+          }
+          if (jump_out_of_loop) {
+            continue;
+          }
+
+          displacement_x = fabs(site_x - current_instance_x);
+          displacement_y = fabs(site_y - current_instance_y);
+          displacement = displacement_x + displacement_y;
+          if (displacement < best_displacement) {
+            best_displacement = displacement;
+            best_site_x = site_x;
+            best_site_y = site_y;
+            if (displacement_x < row_height) {
+              out_of_loop = true;
+            }
+            break;
+          }
+        }
+      }
+
+      current_instance.set_position(Point(best_site_x, best_site_y));
+
+      const RowId best_row_id(
+          (best_site_y - database_.die_rect().min_corner().y()) / row_height);
+
+      assert(best_row_id >= bottom_row_id &&
+             best_row_id <= top_row_id - current_instance_row_height + 1);
+
+      const Row& best_row = database_.row(best_row_id);
+
+      if (current_instance.orientation() != best_row.orientation()) {
+        current_instance.FlipVertically();
+      }
+
+      for (int j = 0; j < current_instance.num_sub_instances(); ++j) {
+        const SubInstanceId sub_instance_id =
+            current_instance.sub_instance_id(j);
+        SubInstance& sub_instance = database_.sub_instance(sub_instance_id);
+        sub_instance.set_position(
+            Point(current_instance.position().x(),
+                  current_instance.position().y() + j * row_height));
+
+        if (sub_instance.position().x() <
+            database_.die_rect().max_corner().x()) {
+          for (int k = 0; k < current_instance_site_width; ++k) {
+            const SiteId site_id = database_.site_id_by_position(
+                Point(current_instance.position().x() + k * site_width,
+                      current_instance.position().y() + j * row_height));
+            Site& site = database_.site(site_id);
+            site.set_sub_instance_id(sub_instance_id);
+          }
+        }
+      }
+    }
+  }
+}
